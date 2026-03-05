@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 from io import StringIO
 import os
+import re
+import pickle
+import requests as http_requests
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 app = Flask(__name__)
@@ -443,8 +446,195 @@ def ajouter():
 
 
 # ============================================================
+# MODELE PMU — Chargement
+# ============================================================
+_model_pmu     = None
+_features_pmu  = None
+_le_driver     = None
+_le_entr       = None
+_driver_stats  = None
+_prior_pmu     = None
+_k_bayes_pmu   = None
+_target_mean_pmu = None
+_target_std_pmu  = None
+_ferrage_map_pmu = None
+
+PMU_MODEL_PATH = "model_pmu.pkl"
+
+def _charger_modele_pmu():
+    global _model_pmu, _features_pmu, _le_driver, _le_entr
+    global _driver_stats, _prior_pmu, _k_bayes_pmu
+    global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu
+
+    if not os.path.exists(PMU_MODEL_PATH):
+        print("⚠️  model_pmu.pkl introuvable — endpoint /notes_pmu désactivé")
+        return False
+    try:
+        with open(PMU_MODEL_PATH, 'rb') as f:
+            pmu = pickle.load(f)
+        _model_pmu       = pmu['model']
+        _features_pmu    = pmu['features']
+        _le_driver       = pmu['le_driver']
+        _le_entr         = pmu['le_entr']
+        _driver_stats    = pmu['driver_stats']
+        _prior_pmu       = pmu['prior']
+        _k_bayes_pmu     = pmu['k_bayes']
+        _target_mean_pmu = pmu['target_mean']
+        _target_std_pmu  = pmu['target_std']
+        _ferrage_map_pmu = pmu['ferrage_map']
+        print(f"✅ Modèle PMU chargé ({len(_features_pmu)} features, {len(_driver_stats)} drivers)")
+        return True
+    except Exception as e:
+        print(f"❌ Erreur chargement model_pmu.pkl : {e}")
+        return False
+
+
+def _parser_musique_api(musique):
+    if not musique:
+        return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
+                'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
+    clean = re.sub(r'\(\d+\)', '', musique)
+    places = []
+    for c in clean:
+        if c == '0':   places.append(1)
+        elif c.isdigit(): places.append(int(c))
+        elif c == 'a': places.append(15)
+    places = places[:10]
+    nb = len(places)
+    if nb == 0:
+        return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
+                'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
+    return {
+        'mus_nb_courses':     nb,
+        'mus_nb_victoires':   sum(1 for p in places if p == 1),
+        'mus_nb_podiums':     sum(1 for p in places if p <= 3),
+        'mus_moy_classement': round(sum(places) / nb, 2),
+        'mus_derniere_place': places[0],
+        'mus_regularite':     round(sum(1 for p in places if p <= 5) / nb, 2),
+    }
+
+
+def _proba_to_note_api(proba_series):
+    notes_raw  = np.log1p(proba_series * 10)
+    notes_norm = (notes_raw - notes_raw.mean()) / (notes_raw.std() + 1e-8)
+    notes_cal  = notes_norm * _target_std_pmu + _target_mean_pmu
+    return notes_cal.clip(1, 20).round(0).astype(int)
+
+
+@app.route('/notes_pmu', methods=['GET'])
+def notes_pmu():
+    """
+    Calcule les notes PMU pour une course donnée.
+    Paramètres GET : date (DDMMYYYY), reunion (int), course (int)
+    Ex: /notes_pmu?date=05032026&reunion=1&course=5
+    """
+    if _model_pmu is None:
+        return jsonify({"error": "Modèle PMU non disponible"}), 503
+
+    date_str = request.args.get('date', '')
+    r_num    = request.args.get('reunion', '')
+    c_num    = request.args.get('course', '')
+
+    if not date_str or not r_num or not c_num:
+        return jsonify({"error": "Paramètres requis : date, reunion, course"}), 400
+
+    try:
+        r_num = int(r_num)
+        c_num = int(c_num)
+    except ValueError:
+        return jsonify({"error": "reunion et course doivent être des entiers"}), 400
+
+    # Appel API PMU
+    url = f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme/{date_str}/R{r_num}/C{c_num}/participants"
+    try:
+        resp = http_requests.get(url, timeout=10)
+        resp.raise_for_status()
+        participants = resp.json().get('participants', [])
+    except Exception as e:
+        return jsonify({"error": f"Erreur API PMU : {str(e)}"}), 502
+
+    if not participants:
+        return jsonify({"error": "Aucun participant trouvé"}), 404
+
+    # Construction DataFrame
+    mediane_rk = 72600
+    rows = []
+    for p in participants:
+        mus   = _parser_musique_api(p.get('musique', ''))
+        gains = p.get('gainsParticipant', {}) or {}
+        rk    = p.get('reductionKilometrique', 0) or 0
+        driver_nom = (p.get('driver', {}).get('nom', '')
+                      if isinstance(p.get('driver'), dict)
+                      else str(p.get('driver', '')))
+        entr_nom   = (p.get('entraineur', {}).get('nom', '')
+                      if isinstance(p.get('entraineur'), dict)
+                      else str(p.get('entraineur', '')))
+        nb_courses = p.get('nombreCourses', 0) or 0
+        row = {
+            'numero':            p.get('numPmu'),
+            'nom':               p.get('nom', ''),
+            'age':               p.get('age', 0) or 0,
+            'deferre':           _ferrage_map_pmu.get(p.get('deferre', 'FERRE'), 0),
+            'oeilleres':         1 if p.get('oeilleres') else 0,
+            'driver':            driver_nom,
+            'entraineur':        entr_nom,
+            'nb_courses':        nb_courses,
+            'nb_victoires':      p.get('nombreVictoires', 0) or 0,
+            'nb_places':         p.get('nombrePlaces', 0) or 0,
+            'gains_carriere':    gains.get('gainsCarriere', 0) or 0,
+            'gains_annee':       gains.get('gainsAnneeEnCours', 0) or 0,
+            'reduction_km_corr': rk if rk > 0 else mediane_rk,
+            'cheval_etranger':   int(rk == 0 and nb_courses > 5),
+        }
+        row.update(mus)
+        rows.append(row)
+
+    df_nc = pd.DataFrame(rows)
+
+    # Encodage driver / entraîneur
+    top_drivers = set(_le_driver.classes_)
+    top_entrs   = set(_le_entr.classes_)
+    df_nc['driver_enc']     = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
+    df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
+    df_nc['driver_id']      = _le_driver.transform(df_nc['driver_enc'])
+    df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
+
+    # Taux bayésien driver
+    df_nc = df_nc.merge(_driver_stats, on='driver', how='left')
+    df_nc['driver_win_rate_bayes'] = df_nc['driver_win_rate_bayes'].fillna(
+        _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
+    )
+    df_nc['driver_n'] = df_nc['driver_n'].fillna(0)
+
+    # Prédiction + note
+    probas = _model_pmu.predict_proba(df_nc[_features_pmu])[:, 1]
+    df_nc['proba_pmu'] = probas
+    df_nc['note_pmu']  = _proba_to_note_api(pd.Series(probas))
+
+    # Résultat JSON
+    result = []
+    for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
+        result.append({
+            "numero":   int(row['numero']),
+            "nom":      str(row['nom']),
+            "note_pmu": int(row['note_pmu']),
+            "proba_pmu": round(float(row['proba_pmu']) * 100, 1),
+            "driver":   str(row['driver']),
+            "etranger": bool(row['cheval_etranger']),
+        })
+
+    return jsonify({
+        "date":     date_str,
+        "reunion":  r_num,
+        "course":   c_num,
+        "chevaux":  result,
+    })
+
+
+# ============================================================
 # DÉMARRAGE
 # ============================================================
+_charger_modele_pmu()
 initialiser()
 
 if __name__ == '__main__':
