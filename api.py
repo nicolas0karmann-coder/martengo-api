@@ -448,23 +448,25 @@ def ajouter():
 # ============================================================
 # MODELE PMU — Chargement
 # ============================================================
-_model_pmu     = None
-_features_pmu  = None
-_le_driver     = None
-_le_entr       = None
-_driver_stats  = None
-_prior_pmu     = None
-_k_bayes_pmu   = None
-_target_mean_pmu = None
-_target_std_pmu  = None
-_ferrage_map_pmu = None
+_model_pmu           = None
+_features_pmu        = None
+_le_driver           = None
+_le_entr             = None
+_driver_stats        = None
+_prior_pmu           = None
+_k_bayes_pmu         = None
+_target_mean_pmu     = None
+_target_std_pmu      = None
+_ferrage_map_pmu     = None
+_avis_map_pmu        = {'POSITIF': 1, 'NEUTRE': 0, 'NEGATIF': -1}
+_mediane_rapport_ref = 18.0
 
 PMU_MODEL_PATH = "model_pmu.pkl"
 
 def _charger_modele_pmu():
     global _model_pmu, _features_pmu, _le_driver, _le_entr
     global _driver_stats, _prior_pmu, _k_bayes_pmu
-    global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu
+    global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu, _mediane_rapport_ref
 
     if not os.path.exists(PMU_MODEL_PATH):
         print("⚠️  model_pmu.pkl introuvable — endpoint /notes_pmu désactivé")
@@ -482,6 +484,7 @@ def _charger_modele_pmu():
         _target_mean_pmu = pmu['target_mean']
         _target_std_pmu  = pmu['target_std']
         _ferrage_map_pmu = pmu['ferrage_map']
+        _mediane_rapport_ref = pmu.get('mediane_rapport_ref', 18.0)
         print(f"✅ Modèle PMU chargé ({len(_features_pmu)} features, {len(_driver_stats)} drivers)")
         return True
     except Exception as e:
@@ -557,7 +560,6 @@ def notes_pmu():
         return jsonify({"error": "Aucun participant trouvé"}), 404
 
     # Construction DataFrame
-    mediane_rk = 72600
     rows = []
     for p in participants:
         mus   = _parser_musique_api(p.get('musique', ''))
@@ -570,6 +572,21 @@ def notes_pmu():
                       if isinstance(p.get('entraineur'), dict)
                       else str(p.get('entraineur', '')))
         nb_courses = p.get('nombreCourses', 0) or 0
+
+        # Cote de référence pour le modèle
+        rapport_ref = None
+        if p.get('dernierRapportReference'):
+            rapport_ref = p['dernierRapportReference'].get('rapport')
+        if rapport_ref is None:
+            rapport_ref = _mediane_rapport_ref
+
+        # Cote directe pour affichage dans l'app (rapport direct = cote en temps réel)
+        cote_app = None
+        if p.get('dernierRapportDirect'):
+            cote_app = p['dernierRapportDirect'].get('rapport')
+        if cote_app is None and p.get('dernierRapportReference'):
+            cote_app = p['dernierRapportReference'].get('rapport')
+
         row = {
             'numero':            p.get('numPmu'),
             'nom':               p.get('nom', ''),
@@ -583,8 +600,12 @@ def notes_pmu():
             'nb_places':         p.get('nombrePlaces', 0) or 0,
             'gains_carriere':    gains.get('gainsCarriere', 0) or 0,
             'gains_annee':       gains.get('gainsAnneeEnCours', 0) or 0,
-            'reduction_km_corr': rk if rk > 0 else mediane_rk,
+            'reduction_km_corr': rk if rk > 0 else 72600,
             'cheval_etranger':   int(rk == 0 and nb_courses > 5),
+            'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
+            'rapport_ref':       float(rapport_ref),
+            'log_rapport_ref':   float(np.log1p(rapport_ref)),
+            '_cote_app':         cote_app,
         }
         row.update(mus)
         rows.append(row)
@@ -615,12 +636,14 @@ def notes_pmu():
     result = []
     for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
         result.append({
-            "numero":   int(row['numero']),
-            "nom":      str(row['nom']),
-            "note_pmu": int(row['note_pmu']),
+            "numero":    int(row['numero']),
+            "nom":       str(row['nom']),
+            "note_pmu":  int(row['note_pmu']),
             "proba_pmu": round(float(row['proba_pmu']) * 100, 1),
-            "driver":   str(row['driver']),
-            "etranger": bool(row['cheval_etranger']),
+            "driver":    str(row['driver']),
+            "etranger":  bool(row['cheval_etranger']),
+            "cote":      float(row['_cote_app']) if row['_cote_app'] is not None else None,
+            "avis":      int(row['avis_entraineur']),
         })
 
     return jsonify({
