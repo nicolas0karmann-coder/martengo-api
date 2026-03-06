@@ -496,32 +496,14 @@ def _parser_musique_api(musique):
     if not musique:
         return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
                 'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
-    
     clean = re.sub(r'\(\d+\)', '', musique)
     places = []
-    
-    i = 0
-    while i < len(clean):
-        c = clean[i]
-        # Format [résultat][type] ex: 1a, 3a, 0a, 2m
-        if c.isdigit() and i + 1 < len(clean) and clean[i+1].isalpha():
-            places.append(10 if c == '0' else int(c))  # 0=non classé, 1-9=classement
-            i += 2
-            continue
-        # Disqualifié : Da, Dm, etc.
-        if c.upper() == 'D' and i + 1 < len(clean) and clean[i+1].isalpha():
-            places.append(15)  # pénalité disqualification
-            i += 2
-            continue
-        # Arrêté : Aa, Am, etc. — ignoré
-        if c.upper() == 'A' and i + 1 < len(clean) and clean[i+1].isalpha():
-            i += 2
-            continue
-        i += 1
-    
+    for c in clean:
+        if c == '0':   places.append(1)
+        elif c.isdigit(): places.append(int(c))
+        elif c == 'a': places.append(15)
     places = places[:10]
     nb = len(places)
-    
     if nb == 0:
         return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
                 'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
@@ -529,9 +511,9 @@ def _parser_musique_api(musique):
         'mus_nb_courses':     nb,
         'mus_nb_victoires':   sum(1 for p in places if p == 1),
         'mus_nb_podiums':     sum(1 for p in places if p <= 3),
-        'mus_moy_classement': round(sum(places)/nb, 2),
+        'mus_moy_classement': round(sum(places) / nb, 2),
         'mus_derniere_place': places[0],
-        'mus_regularite':     round(sum(1 for p in places if p <= 5)/nb, 2),
+        'mus_regularite':     round(sum(1 for p in places if p <= 5) / nb, 2),
     }
 
 
@@ -580,6 +562,9 @@ def notes_pmu():
     # Construction DataFrame
     rows = []
     for p in participants:
+        # Ignorer les non-partants
+        if p.get('statut') == 'NON_PARTANT' or p.get('incident') == 'NON_PARTANT':
+            continue
         mus   = _parser_musique_api(p.get('musique', ''))
         gains = p.get('gainsParticipant', {}) or {}
         rk    = p.get('reductionKilometrique', 0) or 0
