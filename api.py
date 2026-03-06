@@ -496,14 +496,32 @@ def _parser_musique_api(musique):
     if not musique:
         return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
                 'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
+    
     clean = re.sub(r'\(\d+\)', '', musique)
     places = []
-    for c in clean:
-        if c == '0':   places.append(1)
-        elif c.isdigit(): places.append(int(c))
-        elif c == 'a': places.append(15)
+    
+    i = 0
+    while i < len(clean):
+        c = clean[i]
+        # Format [résultat][type] ex: 1a, 3a, 0a, 2m
+        if c.isdigit() and i + 1 < len(clean) and clean[i+1].isalpha():
+            places.append(10 if c == '0' else int(c))  # 0=non classé, 1-9=classement
+            i += 2
+            continue
+        # Disqualifié : Da, Dm, etc.
+        if c.upper() == 'D' and i + 1 < len(clean) and clean[i+1].isalpha():
+            places.append(15)  # pénalité disqualification
+            i += 2
+            continue
+        # Arrêté : Aa, Am, etc. — ignoré
+        if c.upper() == 'A' and i + 1 < len(clean) and clean[i+1].isalpha():
+            i += 2
+            continue
+        i += 1
+    
     places = places[:10]
     nb = len(places)
+    
     if nb == 0:
         return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
                 'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
@@ -511,9 +529,9 @@ def _parser_musique_api(musique):
         'mus_nb_courses':     nb,
         'mus_nb_victoires':   sum(1 for p in places if p == 1),
         'mus_nb_podiums':     sum(1 for p in places if p <= 3),
-        'mus_moy_classement': round(sum(places) / nb, 2),
+        'mus_moy_classement': round(sum(places)/nb, 2),
         'mus_derniere_place': places[0],
-        'mus_regularite':     round(sum(1 for p in places if p <= 5) / nb, 2),
+        'mus_regularite':     round(sum(1 for p in places if p <= 5)/nb, 2),
     }
 
 
@@ -531,132 +549,127 @@ def notes_pmu():
     Paramètres GET : date (DDMMYYYY), reunion (int), course (int)
     Ex: /notes_pmu?date=05032026&reunion=1&course=5
     """
+    if _model_pmu is None:
+        return jsonify({"error": "Modèle PMU non disponible"}), 503
+
+    date_str = request.args.get('date', '')
+    r_num    = request.args.get('reunion', '')
+    c_num    = request.args.get('course', '')
+
+    if not date_str or not r_num or not c_num:
+        return jsonify({"error": "Paramètres requis : date, reunion, course"}), 400
+
     try:
-        if _model_pmu is None:
-            return jsonify({"error": "Modèle PMU non disponible"}), 503
+        r_num = int(r_num)
+        c_num = int(c_num)
+    except ValueError:
+        return jsonify({"error": "reunion et course doivent être des entiers"}), 400
 
-        date_str = request.args.get('date', '')
-        r_num    = request.args.get('reunion', '')
-        c_num    = request.args.get('course', '')
+    # Appel API PMU
+    url = f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme/{date_str}/R{r_num}/C{c_num}/participants"
+    try:
+        resp = http_requests.get(url, timeout=10)
+        resp.raise_for_status()
+        participants = resp.json().get('participants', [])
+    except Exception as e:
+        return jsonify({"error": f"Erreur API PMU : {str(e)}"}), 502
 
-        if not date_str or not r_num or not c_num:
-            return jsonify({"error": "Paramètres requis : date, reunion, course"}), 400
+    if not participants:
+        return jsonify({"error": "Aucun participant trouvé"}), 404
 
-        try:
-            r_num = int(r_num)
-            c_num = int(c_num)
-        except ValueError:
-            return jsonify({"error": "reunion et course doivent être des entiers"}), 400
+    # Construction DataFrame
+    rows = []
+    for p in participants:
+        mus   = _parser_musique_api(p.get('musique', ''))
+        gains = p.get('gainsParticipant', {}) or {}
+        rk    = p.get('reductionKilometrique', 0) or 0
+        driver_nom = (p.get('driver', {}).get('nom', '')
+                      if isinstance(p.get('driver'), dict)
+                      else str(p.get('driver', '')))
+        entr_nom   = (p.get('entraineur', {}).get('nom', '')
+                      if isinstance(p.get('entraineur'), dict)
+                      else str(p.get('entraineur', '')))
+        nb_courses = p.get('nombreCourses', 0) or 0
 
-        # Appel API PMU
-        url = f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme/{date_str}/R{r_num}/C{c_num}/participants"
-        try:
-            resp = http_requests.get(url, timeout=10)
-            resp.raise_for_status()
-            participants = resp.json().get('participants', [])
-        except Exception as e:
-            return jsonify({"error": f"Erreur API PMU : {str(e)}"}), 502
+        # Cote de référence pour le modèle
+        rapport_ref = None
+        if p.get('dernierRapportReference'):
+            rapport_ref = p['dernierRapportReference'].get('rapport')
+        if rapport_ref is None:
+            rapport_ref = _mediane_rapport_ref
 
-        if not participants:
-            return jsonify({"error": "Aucun participant trouvé"}), 404
+        # Cote directe pour affichage dans l'app (rapport direct = cote en temps réel)
+        cote_app = None
+        if p.get('dernierRapportDirect'):
+            cote_app = p['dernierRapportDirect'].get('rapport')
+        if cote_app is None and p.get('dernierRapportReference'):
+            cote_app = p['dernierRapportReference'].get('rapport')
 
-        # Construction DataFrame
-        rows = []
-        for p in participants:
-            mus   = _parser_musique_api(p.get('musique', ''))
-            gains = p.get('gainsParticipant', {}) or {}
-            rk    = p.get('reductionKilometrique', 0) or 0
-            driver_nom = (p.get('driver', {}).get('nom', '')
-                          if isinstance(p.get('driver'), dict)
-                          else str(p.get('driver', '')))
-            entr_nom   = (p.get('entraineur', {}).get('nom', '')
-                          if isinstance(p.get('entraineur'), dict)
-                          else str(p.get('entraineur', '')))
-            nb_courses = p.get('nombreCourses', 0) or 0
+        row = {
+            'numero':            p.get('numPmu'),
+            'nom':               p.get('nom', ''),
+            'age':               p.get('age', 0) or 0,
+            'deferre':           _ferrage_map_pmu.get(p.get('deferre', 'FERRE'), 0),
+            'oeilleres':         1 if p.get('oeilleres') else 0,
+            'driver':            driver_nom,
+            'entraineur':        entr_nom,
+            'nb_courses':        nb_courses,
+            'nb_victoires':      p.get('nombreVictoires', 0) or 0,
+            'nb_places':         p.get('nombrePlaces', 0) or 0,
+            'gains_carriere':    gains.get('gainsCarriere', 0) or 0,
+            'gains_annee':       gains.get('gainsAnneeEnCours', 0) or 0,
+            'reduction_km_corr': rk if rk > 0 else 72600,
+            'cheval_etranger':   int(rk == 0 and nb_courses > 5),
+            'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
+            'rapport_ref':       float(rapport_ref),
+            'log_rapport_ref':   float(np.log1p(rapport_ref)),
+            '_cote_app':         cote_app,
+        }
+        row.update(mus)
+        rows.append(row)
 
-            rapport_ref = None
-            if p.get('dernierRapportReference'):
-                rapport_ref = p['dernierRapportReference'].get('rapport')
-            if rapport_ref is None:
-                rapport_ref = _mediane_rapport_ref
+    df_nc = pd.DataFrame(rows)
 
-            cote_app = None
-            if p.get('dernierRapportDirect'):
-                cote_app = p['dernierRapportDirect'].get('rapport')
-            if cote_app is None and p.get('dernierRapportReference'):
-                cote_app = p['dernierRapportReference'].get('rapport')
+    # Encodage driver / entraîneur
+    top_drivers = set(_le_driver.classes_)
+    top_entrs   = set(_le_entr.classes_)
+    df_nc['driver_enc']     = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
+    df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
+    df_nc['driver_id']      = _le_driver.transform(df_nc['driver_enc'])
+    df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
 
-            row = {
-                'numero':            p.get('numPmu'),
-                'nom':               p.get('nom', ''),
-                'age':               p.get('age', 0) or 0,
-                'deferre':           _ferrage_map_pmu.get(p.get('deferre', 'FERRE'), 0),
-                'oeilleres':         1 if p.get('oeilleres') else 0,
-                'driver':            driver_nom,
-                'entraineur':        entr_nom,
-                'nb_courses':        nb_courses,
-                'nb_victoires':      p.get('nombreVictoires', 0) or 0,
-                'nb_places':         p.get('nombrePlaces', 0) or 0,
-                'gains_carriere':    gains.get('gainsCarriere', 0) or 0,
-                'gains_annee':       gains.get('gainsAnneeEnCours', 0) or 0,
-                'reduction_km_corr': rk if rk > 0 else 72600,
-                'cheval_etranger':   int(rk == 0 and nb_courses > 5),
-                'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
-                'rapport_ref':       float(rapport_ref),
-                'log_rapport_ref':   float(np.log1p(rapport_ref)),
-                '_cote_app':         cote_app,
-            }
-            row.update(mus)
-            rows.append(row)
+    # Taux bayésien driver
+    df_nc = df_nc.merge(_driver_stats, on='driver', how='left')
+    df_nc['driver_win_rate_bayes'] = df_nc['driver_win_rate_bayes'].fillna(
+        _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
+    )
+    df_nc['driver_n'] = df_nc['driver_n'].fillna(0)
 
-        df_nc = pd.DataFrame(rows)
+    # Prédiction + note
+    probas = _model_pmu.predict_proba(df_nc[_features_pmu])[:, 1]
+    df_nc['proba_pmu'] = probas
+    df_nc['note_pmu']  = _proba_to_note_api(pd.Series(probas))
 
-        # Encodage driver / entraîneur
-        top_drivers = set(_le_driver.classes_)
-        top_entrs   = set(_le_entr.classes_)
-        df_nc['driver_enc']     = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
-        df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
-        df_nc['driver_id']      = _le_driver.transform(df_nc['driver_enc'])
-        df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
-
-        # Taux bayésien driver
-        df_nc = df_nc.merge(_driver_stats, on='driver', how='left')
-        df_nc['driver_win_rate_bayes'] = df_nc['driver_win_rate_bayes'].fillna(
-            _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
-        )
-        df_nc['driver_n'] = df_nc['driver_n'].fillna(0)
-
-        # Prédiction + note
-        probas = _model_pmu.predict_proba(df_nc[_features_pmu])[:, 1]
-        df_nc['proba_pmu'] = probas
-        df_nc['note_pmu']  = _proba_to_note_api(pd.Series(probas))
-
-        # Résultat JSON
-        result = []
-        for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
-            result.append({
-                "numero":    int(row['numero']),
-                "nom":       str(row['nom']),
-                "note_pmu":  int(row['note_pmu']),
-                "proba_pmu": round(float(row['proba_pmu']) * 100, 1),
-                "driver":    str(row['driver']),
-                "etranger":  bool(row['cheval_etranger']),
-                "cote":      float(row['_cote_app']) if row['_cote_app'] is not None else None,
-                "avis":      int(row['avis_entraineur']),
-            })
-
-        return jsonify({
-            "date":     date_str,
-            "reunion":  r_num,
-            "course":   c_num,
-            "chevaux":  result,
+    # Résultat JSON
+    result = []
+    for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
+        result.append({
+            "numero":    int(row['numero']),
+            "nom":       str(row['nom']),
+            "note_pmu":  int(row['note_pmu']),
+            "proba_pmu": round(float(row['proba_pmu']) * 100, 1),
+            "driver":    str(row['driver']),
+            "etranger":  bool(row['cheval_etranger']),
+            "cote":      float(row['_cote_app']) if row['_cote_app'] is not None else None,
+            "avis":      int(row['avis_entraineur']),
         })
 
-    except Exception as e:
-        import traceback
-        err = traceback.format_exc()
-        print(f"❌ /notes_pmu error: {err}")
-        return jsonify({"error": str(e), "detail": err}), 500
+    return jsonify({
+        "date":     date_str,
+        "reunion":  r_num,
+        "course":   c_num,
+        "chevaux":  result,
+    })
 
 
 # ============================================================
