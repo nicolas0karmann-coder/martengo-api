@@ -667,10 +667,21 @@ def _cond_vides():
 
 
 def _proba_to_note_api(proba_series):
-    notes_raw  = np.log1p(proba_series * 10)
-    notes_norm = (notes_raw - notes_raw.mean()) / (notes_raw.std() + 1e-8)
-    notes_cal  = notes_norm * _target_std_pmu + _target_mean_pmu
-    return notes_cal.clip(1, 20).round(0).astype(int)
+    """
+    Convertit les probabilités en notes 1-20 bien étalées.
+    Utilise un rang percentile pour garantir une distribution
+    entre 1 et 20 quel que soit le niveau absolu des probas.
+    """
+    s = pd.Series(proba_series).reset_index(drop=True)
+    n = len(s)
+    if n == 1:
+        return pd.Series([10])
+    # Rang percentile : toujours bien étalé même si les probas sont toutes proches
+    ranks = s.rank(method='average', ascending=True)
+    norm  = (ranks - 1) / (n - 1 + 1e-8)
+    # Courbe légèrement exponentielle pour récompenser les vrais favoris
+    notes = 1 + 19 * (norm ** 0.7)
+    return notes.round(0).astype(int).clip(1, 20)
 
 
 @app.route('/notes_pmu', methods=['GET'])
@@ -774,7 +785,6 @@ def notes_pmu():
             'gains_carriere':    gains_car,
             'gains_annee':       gains_ann,
             'reduction_km_corr': rk if rk > 0 else 72600,
-            'cheval_etranger':   int(rk == 0 and nb_courses > 5),
             'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
             'rapport_ref':       float(rapport_ref),
             'log_rapport_ref':   float(np.log1p(rapport_ref)),
@@ -879,7 +889,6 @@ def notes_pmu():
             "note_pmu":  int(row['note_pmu']),
             "proba_pmu": round(float(row['proba_pmu']) * 100, 1),
             "driver":    str(row['driver']),
-            "etranger":  bool(row['cheval_etranger']),
             "cote":      float(row['_cote_app']) if row['_cote_app'] is not None else None,
             "avis":      int(row['avis_entraineur']),
         })
