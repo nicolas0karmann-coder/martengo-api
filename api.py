@@ -755,12 +755,12 @@ def notes_pmu():
         if rapport_ref is None:
             rapport_ref = mediane_rr
 
-        # PMU.fr affiche le rapport de référence, pas le direct
+        # Cote en temps réel (rapport direct)
         cote_app = None
-        if p.get('dernierRapportReference'):
-            cote_app = p['dernierRapportReference'].get('rapport')
-        if cote_app is None and p.get('dernierRapportDirect'):
+        if p.get('dernierRapportDirect'):
             cote_app = p['dernierRapportDirect'].get('rapport')
+        if cote_app is None and p.get('dernierRapportReference'):
+            cote_app = p['dernierRapportReference'].get('rapport')
 
         perf = perfs_map.get(num_pmu, _perf_vide())
 
