@@ -448,11 +448,17 @@ def ajouter():
 # ============================================================
 # MODELE PMU — Chargement
 # ============================================================
+# MODELE PMU — Globals
+# ============================================================
 _model_pmu           = None
 _features_pmu        = None
 _le_driver           = None
 _le_entr             = None
 _driver_stats        = None
+_entr_stats          = None
+_duo_stats           = None
+_spec_dist           = None
+_spec_disc           = None
 _prior_pmu           = None
 _k_bayes_pmu         = None
 _target_mean_pmu     = None
@@ -463,9 +469,16 @@ _mediane_rapport_ref = 18.0
 
 PMU_MODEL_PATH = "model_pmu.pkl"
 
+DISC_MUSIQUE_MAP = {'a': 0, 'm': 1, 'p': 2, 'h': 3, 's': 4, 'c': 5}
+DISCIPLINE_MAP   = {'TROT_ATTELE': 0, 'TROT_MONTE': 1, 'PLAT': 2, 'OBSTACLE': 3}
+CORDE_MAP        = {'CORDE_A_GAUCHE': 0, 'CORDE_A_DROITE': 1}
+SEXE_MAP         = {'MALES': 0, 'FEMELLES': 1, 'MIXTE': 2}
+
+
 def _charger_modele_pmu():
     global _model_pmu, _features_pmu, _le_driver, _le_entr
-    global _driver_stats, _prior_pmu, _k_bayes_pmu
+    global _driver_stats, _entr_stats, _duo_stats, _spec_dist, _spec_disc
+    global _prior_pmu, _k_bayes_pmu
     global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu, _mediane_rapport_ref
 
     if not os.path.exists(PMU_MODEL_PATH):
@@ -474,47 +487,183 @@ def _charger_modele_pmu():
     try:
         with open(PMU_MODEL_PATH, 'rb') as f:
             pmu = pickle.load(f)
-        _model_pmu       = pmu['model']
-        _features_pmu    = pmu['features']
-        _le_driver       = pmu['le_driver']
-        _le_entr         = pmu['le_entr']
-        _driver_stats    = pmu['driver_stats']
-        _prior_pmu       = pmu['prior']
-        _k_bayes_pmu     = pmu['k_bayes']
-        _target_mean_pmu = pmu['target_mean']
-        _target_std_pmu  = pmu['target_std']
-        _ferrage_map_pmu = pmu['ferrage_map']
+        _model_pmu           = pmu['model']
+        _features_pmu        = pmu['features']
+        _le_driver           = pmu['le_driver']
+        _le_entr             = pmu['le_entr']
+        _driver_stats        = pmu['driver_stats']
+        _entr_stats          = pmu.get('entr_stats')
+        _duo_stats           = pmu.get('duo_stats')
+        _spec_dist           = pmu.get('spec_dist')
+        _spec_disc           = pmu.get('spec_disc')
+        _prior_pmu           = pmu['prior']
+        _k_bayes_pmu         = pmu['k_bayes']
+        _target_mean_pmu     = pmu['target_mean']
+        _target_std_pmu      = pmu['target_std']
+        _ferrage_map_pmu     = pmu['ferrage_map']
         _mediane_rapport_ref = pmu.get('mediane_rapport_ref', 18.0)
-        print(f"✅ Modèle PMU chargé ({len(_features_pmu)} features, {len(_driver_stats)} drivers)")
+        v = pmu.get('version', 1)
+        print(f"✅ Modèle PMU v{v} chargé ({len(_features_pmu)} features, "
+              f"{len(_driver_stats)} drivers"
+              + (f", {len(_duo_stats)} duos" if _duo_stats is not None else "") + ")")
         return True
     except Exception as e:
         print(f"❌ Erreur chargement model_pmu.pkl : {e}")
         return False
 
 
+# ── Parseur musique v3 (format réel : position + discipline) ─
 def _parser_musique_api(musique):
+    from collections import Counter
     if not musique:
-        return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
-                'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
-    clean = re.sub(r'\(\d+\)', '', musique)
-    places = []
-    for c in clean:
-        if c == '0':   places.append(1)
-        elif c.isdigit(): places.append(int(c))
-        elif c == 'a': places.append(15)
-    places = places[:10]
-    nb = len(places)
-    if nb == 0:
-        return {'mus_nb_courses':0,'mus_nb_victoires':0,'mus_nb_podiums':0,
-                'mus_moy_classement':99,'mus_derniere_place':99,'mus_regularite':0}
+        return {
+            'mus_nb_courses': 0, 'mus_nb_victoires': 0, 'mus_nb_podiums': 0,
+            'mus_moy_classement': 99, 'mus_derniere_place': 99, 'mus_regularite': 0,
+            'mus_nb_disq': 0, 'mus_taux_disq': 0.0,
+            'mus_nb_tombes': 0, 'mus_nb_arretes': 0,
+            'mus_tendance': 0.0, 'mus_score_pondere': 0.0,
+            'mus_disc_principale': -1, 'mus_nb_disciplines': 0,
+        }
+    clean   = re.sub(r'\(\d+\)', '', musique).strip()
+    tokens  = re.findall(r'[0-9DATRdat][amphsc]', clean)
+    if not tokens:
+        return {
+            'mus_nb_courses': 0, 'mus_nb_victoires': 0, 'mus_nb_podiums': 0,
+            'mus_moy_classement': 99, 'mus_derniere_place': 99, 'mus_regularite': 0,
+            'mus_nb_disq': 0, 'mus_taux_disq': 0.0,
+            'mus_nb_tombes': 0, 'mus_nb_arretes': 0,
+            'mus_tendance': 0.0, 'mus_score_pondere': 0.0,
+            'mus_disc_principale': -1, 'mus_nb_disciplines': 0,
+        }
+    entries, nb_disq, nb_tombes, nb_arretes = [], 0, 0, 0
+    for tok in tokens[:10]:
+        pos, disc = tok[0], tok[1].lower()
+        if pos.isdigit():
+            place = 10 if pos == '0' else int(pos)
+        elif pos.upper() == 'D':
+            place = 15; nb_disq += 1
+        elif pos.upper() == 'T':
+            place = 15; nb_tombes += 1
+        elif pos.upper() == 'A':
+            place = 15; nb_arretes += 1
+        elif pos.upper() == 'R':
+            place = 12
+        else:
+            continue
+        entries.append((place, disc))
+    if not entries:
+        return {
+            'mus_nb_courses': 0, 'mus_nb_victoires': 0, 'mus_nb_podiums': 0,
+            'mus_moy_classement': 99, 'mus_derniere_place': 99, 'mus_regularite': 0,
+            'mus_nb_disq': 0, 'mus_taux_disq': 0.0,
+            'mus_nb_tombes': 0, 'mus_nb_arretes': 0,
+            'mus_tendance': 0.0, 'mus_score_pondere': 0.0,
+            'mus_disc_principale': -1, 'mus_nb_disciplines': 0,
+        }
+    places      = [e[0] for e in entries]
+    disciplines = [e[1] for e in entries]
+    nb          = len(places)
+    recentes    = places[:3]
+    anciennes   = places[-3:] if nb >= 6 else places
+    tendance    = round(float(np.mean(anciennes) - np.mean(recentes)), 2)
+    poids       = [1.0 / (i + 1) for i in range(nb)]
+    score_p     = round(sum(p*(10-min(pl,10)) for p,pl in zip(poids,places))/sum(poids), 3)
+    disc_counter     = Counter(disciplines)
+    disc_principale  = DISC_MUSIQUE_MAP.get(disc_counter.most_common(1)[0][0], -1)
     return {
-        'mus_nb_courses':     nb,
-        'mus_nb_victoires':   sum(1 for p in places if p == 1),
-        'mus_nb_podiums':     sum(1 for p in places if p <= 3),
-        'mus_moy_classement': round(sum(places) / nb, 2),
-        'mus_derniere_place': places[0],
-        'mus_regularite':     round(sum(1 for p in places if p <= 5) / nb, 2),
+        'mus_nb_courses':      nb,
+        'mus_nb_victoires':    sum(1 for p in places if p == 1),
+        'mus_nb_podiums':      sum(1 for p in places if p <= 3),
+        'mus_moy_classement':  round(sum(places) / nb, 2),
+        'mus_derniere_place':  places[0],
+        'mus_regularite':      round(sum(1 for p in places if p <= 5) / nb, 2),
+        'mus_nb_disq':         nb_disq,
+        'mus_taux_disq':       round(nb_disq / nb, 2),
+        'mus_nb_tombes':       nb_tombes,
+        'mus_nb_arretes':      nb_arretes,
+        'mus_tendance':        tendance,
+        'mus_score_pondere':   score_p,
+        'mus_disc_principale': disc_principale,
+        'mus_nb_disciplines':  len(disc_counter),
     }
+
+
+def _perf_vide():
+    return {
+        'perf_nb': 0, 'perf_moy_classement': 99, 'perf_derniere_place': 99,
+        'perf_nb_top3': 0, 'perf_taux_top3': 0.0,
+        'perf_moy_rk': 0.0, 'perf_moy_gains': 0.0, 'perf_regularite': 0.0,
+    }
+
+
+def _fetch_performances(date_str, r_num, c_num):
+    url = (f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme"
+           f"/{date_str}/R{r_num}/C{c_num}/performances-detaillees")
+    try:
+        resp = http_requests.get(url, timeout=5)
+        if resp.status_code in (400, 404, 204):
+            return {}
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return {}
+    result = {}
+    for cheval in data.get('performancesDetaillees', []):
+        num_pmu = cheval.get('numPmu')
+        perfs   = cheval.get('performances', [])[:5]
+        if not perfs:
+            result[num_pmu] = _perf_vide(); continue
+        classements, temps_list, gains_list = [], [], []
+        for perf in perfs:
+            cl = perf.get('ordreArrivee') or perf.get('classement')
+            if cl and cl <= 15:
+                classements.append(cl)
+            t = perf.get('tempsObtenu') or perf.get('reductionKilometrique')
+            if t and t > 0: temps_list.append(t)
+            g = perf.get('gainsCourse') or perf.get('gains') or 0
+            if g: gains_list.append(g)
+        nb = len(classements)
+        result[num_pmu] = {
+            'perf_nb':             nb,
+            'perf_moy_classement': round(sum(classements)/nb, 2) if nb > 0 else 99,
+            'perf_derniere_place': classements[0] if classements else 99,
+            'perf_nb_top3':        sum(1 for c in classements if c <= 3),
+            'perf_taux_top3':      round(sum(1 for c in classements if c<=3)/nb,2) if nb>0 else 0.0,
+            'perf_moy_rk':         round(sum(temps_list)/len(temps_list),1) if temps_list else 0.0,
+            'perf_moy_gains':      round(sum(gains_list)/len(gains_list),1) if gains_list else 0.0,
+            'perf_regularite':     round(sum(1 for c in classements if c<=5)/nb,2) if nb>0 else 0.0,
+        }
+    return result
+
+
+def _fetch_conditions(date_str, r_num, c_num):
+    url = f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme/{date_str}"
+    try:
+        resp = http_requests.get(url, timeout=5)
+        if resp.status_code in (400, 404, 204):
+            return _cond_vides()
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return _cond_vides()
+    for reunion in data.get('programme', {}).get('reunions', []):
+        if reunion.get('numOfficiel') == r_num or reunion.get('numReunion') == r_num:
+            for course in reunion.get('courses', []):
+                if course.get('numOrdre') == c_num or course.get('numExterne') == c_num:
+                    return {
+                        'distance':       course.get('distance', 0) or 0,
+                        'montant_prix':   course.get('montantPrix', 0) or 0,
+                        'discipline':     DISCIPLINE_MAP.get(course.get('discipline',''), 0),
+                        'corde':          CORDE_MAP.get(course.get('corde',''), 0),
+                        'condition_sexe': SEXE_MAP.get(course.get('conditionSexe',''), 2),
+                        'nb_partants':    course.get('nombreDeclaresPartants', 0) or 0,
+                    }
+    return _cond_vides()
+
+
+def _cond_vides():
+    return {'distance': 0, 'montant_prix': 0, 'discipline': 0,
+            'corde': 0, 'condition_sexe': 2, 'nb_partants': 0}
 
 
 def _proba_to_note_api(proba_series):
@@ -540,17 +689,20 @@ def notes_pmu():
 
     if not date_str or not r_num or not c_num:
         return jsonify({"error": "Paramètres requis : date, reunion, course"}), 400
-
     try:
-        r_num = int(r_num)
-        c_num = int(c_num)
+        r_num = int(r_num); c_num = int(c_num)
     except ValueError:
         return jsonify({"error": "reunion et course doivent être des entiers"}), 400
 
-    # Appel API PMU
-    url = f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme/{date_str}/R{r_num}/C{c_num}/participants"
+    # ── Conditions de course & performances détaillées ───────
+    conditions = _fetch_conditions(date_str, r_num, c_num)
+    perfs_map  = _fetch_performances(date_str, r_num, c_num)
+
+    # ── Participants ──────────────────────────────────────────
+    url = (f"https://offline.turfinfo.api.pmu.fr/rest/client/7/programme"
+           f"/{date_str}/R{r_num}/C{c_num}/participants")
     try:
-        resp = http_requests.get(url, timeout=10)
+        resp = http_requests.get(url, timeout=8)
         resp.raise_for_status()
         participants = resp.json().get('participants', [])
     except Exception as e:
@@ -559,50 +711,68 @@ def notes_pmu():
     if not participants:
         return jsonify({"error": "Aucun participant trouvé"}), 404
 
-    # Construction DataFrame
+    # Médiane rapport de référence
+    rapports_course = [
+        p['dernierRapportReference'].get('rapport')
+        for p in participants
+        if p.get('dernierRapportReference') and p.get('statut') != 'NON_PARTANT'
+    ]
+    rapports_course  = [r for r in rapports_course if r]
+    mediane_rr       = float(np.median(rapports_course)) if rapports_course else _mediane_rapport_ref
+
     rows = []
     for p in participants:
-        # Ignorer les non-partants
         if p.get('statut') == 'NON_PARTANT' or p.get('incident') == 'NON_PARTANT':
             continue
-        mus   = _parser_musique_api(p.get('musique', ''))
-        gains = p.get('gainsParticipant', {}) or {}
-        rk    = p.get('reductionKilometrique', 0) or 0
-        driver_nom = (p.get('driver', {}).get('nom', '')
-                      if isinstance(p.get('driver'), dict)
-                      else str(p.get('driver', '')))
-        entr_nom   = (p.get('entraineur', {}).get('nom', '')
-                      if isinstance(p.get('entraineur'), dict)
-                      else str(p.get('entraineur', '')))
+        mus        = _parser_musique_api(p.get('musique', ''))
+        gains      = p.get('gainsParticipant', {}) or {}
+        rk         = p.get('reductionKilometrique', 0) or 0
+        num_pmu    = p.get('numPmu')
         nb_courses = p.get('nombreCourses', 0) or 0
+        driver_nom = (p.get('driver', {}).get('nom', '')
+                      if isinstance(p.get('driver'), dict) else str(p.get('driver', '')))
+        entr_nom   = (p.get('entraineur', {}).get('nom', '')
+                      if isinstance(p.get('entraineur'), dict) else str(p.get('entraineur', '')))
+        nb_victoires = p.get('nombreVictoires', 0) or 0
+        nb_places    = p.get('nombrePlaces', 0) or 0
+        gains_car    = gains.get('gainsCarriere', 0) or 0
+        gains_ann    = gains.get('gainsAnneeEnCours', 0) or 0
 
-        # Cote de référence pour le modèle
         rapport_ref = None
         if p.get('dernierRapportReference'):
             rapport_ref = p['dernierRapportReference'].get('rapport')
         if rapport_ref is None:
-            rapport_ref = _mediane_rapport_ref
+            rapport_ref = mediane_rr
 
-        # Cote directe pour affichage dans l'app (rapport direct = cote en temps réel)
         cote_app = None
         if p.get('dernierRapportDirect'):
             cote_app = p['dernierRapportDirect'].get('rapport')
         if cote_app is None and p.get('dernierRapportReference'):
             cote_app = p['dernierRapportReference'].get('rapport')
 
+        perf = perfs_map.get(num_pmu, _perf_vide())
+
         row = {
-            'numero':            p.get('numPmu'),
+            'numero':            num_pmu,
             'nom':               p.get('nom', ''),
+            # Conditions course
+            'distance':          conditions['distance'],
+            'montant_prix':      conditions['montant_prix'],
+            'discipline':        conditions['discipline'],
+            'corde':             conditions['corde'],
+            'condition_sexe':    conditions['condition_sexe'],
+            'nb_partants':       conditions['nb_partants'],
+            # Cheval
             'age':               p.get('age', 0) or 0,
             'deferre':           _ferrage_map_pmu.get(p.get('deferre', 'FERRE'), 0),
             'oeilleres':         1 if p.get('oeilleres') else 0,
             'driver':            driver_nom,
             'entraineur':        entr_nom,
             'nb_courses':        nb_courses,
-            'nb_victoires':      p.get('nombreVictoires', 0) or 0,
-            'nb_places':         p.get('nombrePlaces', 0) or 0,
-            'gains_carriere':    gains.get('gainsCarriere', 0) or 0,
-            'gains_annee':       gains.get('gainsAnneeEnCours', 0) or 0,
+            'nb_victoires':      nb_victoires,
+            'nb_places':         nb_places,
+            'gains_carriere':    gains_car,
+            'gains_annee':       gains_ann,
             'reduction_km_corr': rk if rk > 0 else 72600,
             'cheval_etranger':   int(rk == 0 and nb_courses > 5),
             'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
@@ -611,31 +781,96 @@ def notes_pmu():
             '_cote_app':         cote_app,
         }
         row.update(mus)
+        row.update(perf)
         rows.append(row)
 
     df_nc = pd.DataFrame(rows)
 
-    # Encodage driver / entraîneur
+    # ── Features dérivées ─────────────────────────────────────
+    df_nc['ratio_victoires']  = df_nc['nb_victoires'] / (df_nc['nb_courses'] + 1)
+    df_nc['ratio_places']     = df_nc['nb_places']    / (df_nc['nb_courses'] + 1)
+    df_nc['gains_par_course'] = df_nc['gains_carriere'] / (df_nc['nb_courses'] + 1)
+    df_nc['ratio_gains_rec']  = df_nc['gains_annee'] / (df_nc['gains_carriere'] + 1)
+    df_nc['log_distance']     = np.log1p(df_nc['distance'])
+    df_nc['log_montant_prix'] = np.log1p(df_nc['montant_prix'])
+    df_nc['rang_cote_course'] = df_nc['rapport_ref'].rank(ascending=True, method='min')
+    nb_ch = len(df_nc)
+    df_nc['rang_cote_norme']  = (df_nc['rang_cote_course'] - 1) / (nb_ch - 1 + 1e-8)
+    df_nc['accord_mus_perf']  = (
+        (df_nc['mus_moy_classement'] < 5) & (df_nc['perf_moy_classement'] < 5)
+    ).astype(int)
+    df_nc['tranche_distance'] = pd.cut(
+        df_nc['distance'], bins=[0, 1600, 2100, 2700, 9999],
+        labels=['court', 'moyen', 'long', 'tres_long']
+    ).astype(str)
+
+    _fallback = _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
+
+    # Driver
     top_drivers = set(_le_driver.classes_)
-    top_entrs   = set(_le_entr.classes_)
-    df_nc['driver_enc']     = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
+    df_nc['driver_enc'] = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
+    df_nc['driver_id']  = _le_driver.transform(df_nc['driver_enc'])
+    d_cols = ['driver', 'driver_win_rate_bayes', 'driver_n']
+    if 'driver_place_rate_bayes' in _driver_stats.columns:
+        d_cols += ['driver_place_rate_bayes', 'driver_disq']
+    df_nc = df_nc.merge(_driver_stats[d_cols], on='driver', how='left')
+    df_nc['driver_win_rate_bayes']   = df_nc['driver_win_rate_bayes'].fillna(_fallback)
+    df_nc['driver_n']                = df_nc['driver_n'].fillna(0)
+    if 'driver_place_rate_bayes' in df_nc.columns:
+        df_nc['driver_place_rate_bayes'] = df_nc['driver_place_rate_bayes'].fillna(_fallback)
+        df_nc['driver_disq']             = df_nc['driver_disq'].fillna(0)
+
+    # Entraîneur
+    top_entrs = set(_le_entr.classes_)
     df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
-    df_nc['driver_id']      = _le_driver.transform(df_nc['driver_enc'])
     df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
+    if _entr_stats is not None:
+        df_nc = df_nc.merge(
+            _entr_stats[['entraineur', 'entr_win_rate_bayes', 'entr_n']],
+            on='entraineur', how='left')
+    if 'entr_win_rate_bayes' not in df_nc.columns:
+        df_nc['entr_win_rate_bayes'] = _fallback
+        df_nc['entr_n'] = 0
+    df_nc['entr_win_rate_bayes'] = df_nc['entr_win_rate_bayes'].fillna(_fallback)
+    df_nc['entr_n']              = df_nc['entr_n'].fillna(0)
 
-    # Taux bayésien driver
-    df_nc = df_nc.merge(_driver_stats, on='driver', how='left')
-    df_nc['driver_win_rate_bayes'] = df_nc['driver_win_rate_bayes'].fillna(
-        _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
-    )
-    df_nc['driver_n'] = df_nc['driver_n'].fillna(0)
+    # Duo
+    if _duo_stats is not None:
+        df_nc = df_nc.merge(
+            _duo_stats[['nom', 'driver', 'duo_win_rate_bayes', 'duo_n']],
+            on=['nom', 'driver'], how='left')
+    if 'duo_win_rate_bayes' not in df_nc.columns:
+        df_nc['duo_win_rate_bayes'] = _fallback
+        df_nc['duo_n'] = 0
+    df_nc['duo_win_rate_bayes'] = df_nc['duo_win_rate_bayes'].fillna(_fallback)
+    df_nc['duo_n']              = df_nc['duo_n'].fillna(0)
 
-    # Prédiction + note
+    # Spécialisation distance
+    if _spec_dist is not None:
+        df_nc = df_nc.merge(
+            _spec_dist[['nom', 'tranche_distance', 'spec_dist_rate', 'spec_n']],
+            on=['nom', 'tranche_distance'], how='left')
+    if 'spec_dist_rate' not in df_nc.columns:
+        df_nc['spec_dist_rate'] = _fallback
+        df_nc['spec_n'] = 0
+    df_nc['spec_dist_rate'] = df_nc['spec_dist_rate'].fillna(_fallback)
+    df_nc['spec_n']         = df_nc['spec_n'].fillna(0)
+
+    # Spécialisation discipline
+    if _spec_disc is not None:
+        df_nc = df_nc.merge(
+            _spec_disc[['nom', 'discipline', 'spec_disc_rate']],
+            on=['nom', 'discipline'], how='left')
+    if 'spec_disc_rate' not in df_nc.columns:
+        df_nc['spec_disc_rate'] = _fallback
+    df_nc['spec_disc_rate'] = df_nc['spec_disc_rate'].fillna(_fallback)
+
+    # ── Prédiction + note ────────────────────────────────────
     probas = _model_pmu.predict_proba(df_nc[_features_pmu])[:, 1]
     df_nc['proba_pmu'] = probas
     df_nc['note_pmu']  = _proba_to_note_api(pd.Series(probas))
 
-    # Résultat JSON
+    # ── Résultat JSON ────────────────────────────────────────
     result = []
     for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
         result.append({
