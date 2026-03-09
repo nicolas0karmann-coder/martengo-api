@@ -786,7 +786,6 @@ def notes_pmu():
             'gains_carriere':    gains_car,
             'gains_annee':       gains_ann,
             'reduction_km_corr': rk if rk > 0 else 72600,
-            'cheval_etranger':   int(rk == 0 and nb_courses > 5),
             'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
             'rapport_ref':       float(rapport_ref),
             'log_rapport_ref':   float(np.log1p(rapport_ref)),
