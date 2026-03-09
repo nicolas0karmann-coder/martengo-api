@@ -466,6 +466,7 @@ _target_std_pmu      = None
 _ferrage_map_pmu     = None
 _avis_map_pmu        = {'POSITIF': 1, 'NEUTRE': 0, 'NEGATIF': -1}
 _mediane_rapport_ref = 18.0
+_hist_snapshot       = None
 
 PMU_MODEL_PATH = "model_pmu.pkl"
 
@@ -480,6 +481,7 @@ def _charger_modele_pmu():
     global _driver_stats, _entr_stats, _duo_stats, _spec_dist, _spec_disc
     global _prior_pmu, _k_bayes_pmu
     global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu, _mediane_rapport_ref
+    global _hist_snapshot
 
     if not os.path.exists(PMU_MODEL_PATH):
         print("⚠️  model_pmu.pkl introuvable — endpoint /notes_pmu désactivé")
@@ -502,6 +504,7 @@ def _charger_modele_pmu():
         _target_std_pmu      = pmu['target_std']
         _ferrage_map_pmu     = pmu['ferrage_map']
         _mediane_rapport_ref = pmu.get('mediane_rapport_ref', 18.0)
+        _hist_snapshot       = pmu.get('hist_snapshot')
         v = pmu.get('version', 1)
         print(f"✅ Modèle PMU v{v} chargé ({len(_features_pmu)} features, "
               f"{len(_driver_stats)} drivers"
@@ -788,7 +791,13 @@ def notes_pmu():
             'reduction_km_corr': rk if rk > 0 else 72600,
             'avis_entraineur':   _avis_map_pmu.get(p.get('avisEntraineur', 'NEUTRE'), 0),
             'rapport_ref':       float(rapport_ref),
+            'rapport_direct':    float(cote_app) if cote_app else float(rapport_ref),
+            'ecart_cotes':       float(cote_app - rapport_ref) if cote_app else 0.0,
             'log_rapport_ref':   float(np.log1p(rapport_ref)),
+            'nb_places_second':  p.get('nombrePlacesSecond', 0) or 0,
+            'nb_places_troisieme': p.get('nombrePlacesTroisieme', 0) or 0,
+            'temps_obtenu':      float(p.get('tempsObtenu', 0) or 0),
+            'handicap_distance': float(p.get('handicapDistance', 0) or conditions['distance'] or 0),
             '_cote_app':         cote_app,
         }
         row.update(mus)
@@ -801,7 +810,14 @@ def notes_pmu():
     df_nc['ratio_victoires']  = df_nc['nb_victoires'] / (df_nc['nb_courses'] + 1)
     df_nc['ratio_places']     = df_nc['nb_places']    / (df_nc['nb_courses'] + 1)
     df_nc['gains_par_course'] = df_nc['gains_carriere'] / (df_nc['nb_courses'] + 1)
-    df_nc['ratio_gains_rec']  = df_nc['gains_annee'] / (df_nc['gains_carriere'] + 1)
+    df_nc['ratio_gains_rec']        = df_nc['gains_annee'] / (df_nc['gains_carriere'] + 1)
+    df_nc['ratio_places_second']    = df_nc['nb_places_second']    / (df_nc['nb_courses'] + 1)
+    df_nc['ratio_places_troisieme'] = df_nc['nb_places_troisieme'] / (df_nc['nb_courses'] + 1)
+    # Temps normalisé
+    df_nc['temps_norme'] = df_nc.apply(
+        lambda r: round(r['temps_obtenu'] / r['handicap_distance'], 4)
+        if r['handicap_distance'] > 0 and r['temps_obtenu'] > 0 else np.nan, axis=1
+    )
     df_nc['log_distance']     = np.log1p(df_nc['distance'])
     df_nc['log_montant_prix'] = np.log1p(df_nc['montant_prix'])
     df_nc['rang_cote_course'] = df_nc['rapport_ref'].rank(ascending=True, method='min')
@@ -875,6 +891,22 @@ def notes_pmu():
     if 'spec_disc_rate' not in df_nc.columns:
         df_nc['spec_disc_rate'] = _fallback
     df_nc['spec_disc_rate'] = df_nc['spec_disc_rate'].fillna(_fallback)
+
+    # Historique cheval
+    if _hist_snapshot is not None:
+        df_nc = df_nc.merge(
+            _hist_snapshot[['nom', 'hist_nb', 'hist_moy_classement', 'hist_nb_top3',
+                            'hist_taux_top3', 'hist_moy_temps', 'hist_tendance', 'hist_moy_cote']],
+            on='nom', how='left'
+        )
+    for col in ['hist_nb', 'hist_nb_top3']:
+        if col not in df_nc.columns:
+            df_nc[col] = 0
+        df_nc[col] = df_nc[col].fillna(0)
+    for col in ['hist_moy_classement', 'hist_taux_top3', 'hist_moy_temps',
+                'hist_tendance', 'hist_moy_cote']:
+        if col not in df_nc.columns:
+            df_nc[col] = np.nan
 
     # ── Prédiction + note ────────────────────────────────────
     probas = _model_pmu.predict_proba(df_nc[_features_pmu])[:, 1]
