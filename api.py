@@ -232,6 +232,7 @@ _ferrage_map_pmu     = None
 _avis_map_pmu        = {'POSITIF': 1, 'NEUTRE': 0, 'NEGATIF': -1}
 _mediane_rapport_ref = 18.0
 _hist_snapshot       = None
+_seuils_notes        = None
 
 PMU_MODEL_PATH = "model_pmu.pkl"
 
@@ -246,7 +247,7 @@ def _charger_modele_pmu():
     global _driver_stats, _entr_stats, _duo_stats, _spec_dist, _spec_disc
     global _prior_pmu, _k_bayes_pmu
     global _target_mean_pmu, _target_std_pmu, _ferrage_map_pmu, _mediane_rapport_ref
-    global _hist_snapshot
+    global _hist_snapshot, _seuils_notes
 
     if not os.path.exists(PMU_MODEL_PATH):
         print("⚠️  model_pmu.pkl introuvable — endpoint /notes_pmu désactivé")
@@ -270,6 +271,7 @@ def _charger_modele_pmu():
         _ferrage_map_pmu     = pmu['ferrage_map']
         _mediane_rapport_ref = pmu.get('mediane_rapport_ref', 18.0)
         _hist_snapshot       = pmu.get('hist_snapshot')
+        _seuils_notes        = pmu.get('seuils_notes')
         v = pmu.get('version', 1)
         print(f"✅ Modèle PMU v{v} chargé ({len(_features_pmu)} features, "
               f"{len(_driver_stats)} drivers"
@@ -434,22 +436,26 @@ def _cond_vides():
             'corde': 0, 'condition_sexe': 2, 'nb_partants': 0}
 
 
+# Seuils par défaut si bundle ne les contient pas
+_SEUILS_DEFAUT = [
+    (0.001, 1), (0.003, 2), (0.006, 3), (0.010, 4), (0.017, 5),
+    (0.030, 6), (0.060, 7), (0.120, 8), (0.220, 9), (0.350, 10),
+    (0.480, 11), (0.580, 12), (0.680, 13), (0.770, 14), (0.850, 15),
+    (0.910, 16), (0.955, 17), (0.985, 18), (0.997, 19), (1.001, 20),
+]
+
 def _proba_to_note_api(proba_series):
     """
-    Convertit les probabilités en notes 1-20 bien étalées.
-    Utilise un rang percentile pour garantir une distribution
-    entre 1 et 20 quel que soit le niveau absolu des probas.
+    Convertit les probabilités en notes 1-20 via seuils asymétriques.
+    Utilise les seuils du bundle si disponibles, sinon les seuils par défaut.
     """
-    s = pd.Series(proba_series).reset_index(drop=True)
-    n = len(s)
-    if n == 1:
-        return pd.Series([10])
-    # Rang percentile : toujours bien étalé même si les probas sont toutes proches
-    ranks = s.rank(method='average', ascending=True)
-    norm  = (ranks - 1) / (n - 1 + 1e-8)
-    # Courbe légèrement exponentielle pour récompenser les vrais favoris
-    notes = 1 + 19 * (norm ** 0.7)
-    return notes.round(0).astype(int).clip(1, 20)
+    seuils = _seuils_notes if _seuils_notes is not None else _SEUILS_DEFAUT
+    def _convert(p):
+        for seuil, note in seuils:
+            if p < seuil:
+                return note
+        return 20
+    return pd.Series(proba_series).apply(_convert)
 
 
 @app.route('/notes_pmu', methods=['GET'])
