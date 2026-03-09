@@ -684,6 +684,20 @@ def notes_pmu():
     df_nc['proba_pmu'] = probas
     df_nc['note_pmu']  = _proba_to_note_api(pd.Series(probas))
 
+    # ── Plancher note par cote ────────────────────────────────
+    # Un cheval favori ne peut pas avoir note 1 même sans historique
+    def _plancher_cote(cote):
+        if cote is None:   return 1
+        if cote < 3:       return 12
+        elif cote < 5:     return 10
+        elif cote < 8:     return 8
+        elif cote < 15:    return 6
+        elif cote < 25:    return 4
+        else:              return 1
+
+    df_nc['plancher'] = df_nc['_cote_app'].apply(_plancher_cote)
+    df_nc['note_pmu'] = df_nc[['note_pmu', 'plancher']].max(axis=1)
+
     # ── Résultat JSON ────────────────────────────────────────
     result = []
     for _, row in df_nc.sort_values('note_pmu', ascending=False).iterrows():
