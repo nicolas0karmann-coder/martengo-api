@@ -141,46 +141,9 @@ def predict():
     tous = df_nc.sort_values(['proba_absolu','rapport'], ascending=[False,False])
     top3_absolu = tous.head(3)['numero'].tolist()
 
-    # Labels lisibles pour chaque feature
-    FEATURE_LABELS = {
-        'note':              'Note',
-        'rapport':           'Cote',
-        'log_rapport':       'Log cote',
-        'note_normalisee':   'Note normalisée',
-        'inverse_rapport':   'Inverse cote',
-        'score_valeur':      'Score valeur',
-        'rapport_over_10':   'Cote > 10',
-        'valeur_brute':      'Valeur brute',
-        'ratio_note_rapport':'Ratio note/cote',
-    }
-
-    # Importance globale des features (modèle absolu)
-    fi_abs = modele_abs.feature_importances_  # shape: (n_features,)
-
-    # Pour chaque cheval : contribution = importance × |valeur normalisée|
-    # On normalise chaque feature sur l'ensemble de la course pour avoir une contribution relative
-    df_feats = tous[FEATURES_ABSOLU].copy()
-    feat_min = df_feats.min()
-    feat_max = df_feats.max()
-    feat_range = (feat_max - feat_min).replace(0, 1)
-    df_feats_norm = (df_feats - feat_min) / feat_range  # 0..1
-
     # Résultat complet trié par proba absolu
     tous_list = []
     for _, row in tous.iterrows():
-        # Contribution de chaque feature pour ce cheval
-        contribs = []
-        for j, feat in enumerate(FEATURES_ABSOLU):
-            val_norm = float(df_feats_norm.loc[row.name, feat])
-            contrib  = float(fi_abs[j]) * val_norm
-            contribs.append({
-                "feature": FEATURE_LABELS.get(feat, feat),
-                "valeur":  round(float(row[feat]), 3),
-                "score":   round(contrib * 100, 1),
-            })
-        # Trier par score décroissant, garder top 5
-        top_features = sorted(contribs, key=lambda x: x['score'], reverse=True)[:5]
-
         tous_list.append({
             "numero":          int(row['numero']),
             "note":            float(row['note']),
@@ -189,7 +152,6 @@ def predict():
             "proba_absolu":    round(float(row['proba_absolu']) * 100, 1),
             "top3_principal":  int(row['numero']) in top3_principal,
             "top3_absolu":     int(row['numero']) in top3_absolu,
-            "top_features":    top_features,
         })
 
     return jsonify({
