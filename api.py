@@ -253,7 +253,7 @@ _mediane_rapport_ref = 18.0
 _hist_snapshot       = None
 _seuils_notes        = None
 
-PMU_MODEL_PATH = "model_pmu.pkl"
+PMU_MODEL_PATH = "model_pmu_v5.pkl"
 
 DISC_MUSIQUE_MAP = {'a': 0, 'm': 1, 'p': 2, 'h': 3, 's': 4, 'c': 5}
 DISCIPLINE_MAP   = {'TROT_ATTELE': 0, 'TROT_MONTE': 1, 'PLAT': 2, 'OBSTACLE': 3}
@@ -276,25 +276,24 @@ def _charger_modele_pmu():
             pmu = pickle.load(f)
         _model_pmu           = pmu['model']
         _features_pmu        = pmu['features']
-        _le_driver           = pmu['le_driver']
-        _le_entr             = pmu['le_entr']
-        _driver_stats        = pmu['driver_stats']
+        _le_driver           = pmu.get('le_driver')
+        _le_entr             = pmu.get('le_entr')
+        _driver_stats        = pmu.get('driver_stats')
         _entr_stats          = pmu.get('entr_stats')
         _duo_stats           = pmu.get('duo_stats')
         _spec_dist           = pmu.get('spec_dist')
         _spec_disc           = pmu.get('spec_disc')
         _prior_pmu           = pmu['prior']
         _k_bayes_pmu         = pmu['k_bayes']
-        _target_mean_pmu     = pmu['target_mean']
-        _target_std_pmu      = pmu['target_std']
+        _target_mean_pmu     = pmu.get('target_mean')
+        _target_std_pmu      = pmu.get('target_std')
         _ferrage_map_pmu     = pmu['ferrage_map']
         _mediane_rapport_ref = pmu.get('mediane_rapport_ref', 18.0)
         _hist_snapshot       = pmu.get('hist_snapshot')
         _seuils_notes        = pmu.get('seuils_notes')
         v = pmu.get('version', 1)
-        print(f"✅ Modèle PMU v{v} chargé ({len(_features_pmu)} features, "
-              f"{len(_driver_stats)} drivers"
-              + (f", {len(_duo_stats)} duos" if _duo_stats is not None else "") + ")")
+        nb_duos = len(_duo_stats) if _duo_stats is not None else 0
+        print(f"✅ Modèle PMU v{v} chargé ({len(_features_pmu)} features, {nb_duos} duos)")
         return True
     except Exception as e:
         print(f"❌ Erreur chargement model_pmu.pkl : {e}")
@@ -623,24 +622,26 @@ def notes_pmu():
 
     _fallback = _prior_pmu * _k_bayes_pmu / (_k_bayes_pmu + 1)
 
-    # Driver
-    top_drivers = set(_le_driver.classes_)
-    df_nc['driver_enc'] = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
-    df_nc['driver_id']  = _le_driver.transform(df_nc['driver_enc'])
-    d_cols = ['driver', 'driver_win_rate_bayes', 'driver_n']
-    if 'driver_place_rate_bayes' in _driver_stats.columns:
-        d_cols += ['driver_place_rate_bayes', 'driver_disq']
-    df_nc = df_nc.merge(_driver_stats[d_cols], on='driver', how='left')
-    df_nc['driver_win_rate_bayes']   = df_nc['driver_win_rate_bayes'].fillna(_fallback)
-    df_nc['driver_n']                = df_nc['driver_n'].fillna(0)
-    if 'driver_place_rate_bayes' in df_nc.columns:
-        df_nc['driver_place_rate_bayes'] = df_nc['driver_place_rate_bayes'].fillna(_fallback)
-        df_nc['driver_disq']             = df_nc['driver_disq'].fillna(0)
+    # Driver (V5 : pas utilisé dans les features, on skip l'encodage)
+    if _le_driver is not None and _driver_stats is not None:
+        top_drivers = set(_le_driver.classes_)
+        df_nc['driver_enc'] = df_nc['driver'].apply(lambda x: x if x in top_drivers else 'AUTRE')
+        df_nc['driver_id']  = _le_driver.transform(df_nc['driver_enc'])
+        d_cols = ['driver', 'driver_win_rate_bayes', 'driver_n']
+        if 'driver_place_rate_bayes' in _driver_stats.columns:
+            d_cols += ['driver_place_rate_bayes', 'driver_disq']
+        df_nc = df_nc.merge(_driver_stats[d_cols], on='driver', how='left')
+        df_nc['driver_win_rate_bayes']   = df_nc['driver_win_rate_bayes'].fillna(_fallback)
+        df_nc['driver_n']                = df_nc['driver_n'].fillna(0)
+        if 'driver_place_rate_bayes' in df_nc.columns:
+            df_nc['driver_place_rate_bayes'] = df_nc['driver_place_rate_bayes'].fillna(_fallback)
+            df_nc['driver_disq']             = df_nc['driver_disq'].fillna(0)
 
     # Entraîneur
-    top_entrs = set(_le_entr.classes_)
-    df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
-    df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
+    if _le_entr is not None:
+        top_entrs = set(_le_entr.classes_)
+        df_nc['entraineur_enc'] = df_nc['entraineur'].apply(lambda x: x if x in top_entrs else 'AUTRE')
+        df_nc['entraineur_id']  = _le_entr.transform(df_nc['entraineur_enc'])
     if _entr_stats is not None:
         df_nc = df_nc.merge(
             _entr_stats[['entraineur', 'entr_win_rate_bayes', 'entr_n']],
@@ -661,6 +662,8 @@ def notes_pmu():
         df_nc['duo_n'] = 0
     df_nc['duo_win_rate_bayes'] = df_nc['duo_win_rate_bayes'].fillna(_fallback)
     df_nc['duo_n']              = df_nc['duo_n'].fillna(0)
+    # ✨ V5 — duo_fiable : 1 si duo vu >= 2 fois, sinon 0
+    df_nc['duo_fiable'] = (df_nc['duo_n'] >= 2).astype(int)
 
     # Spécialisation distance
     if _spec_dist is not None:
