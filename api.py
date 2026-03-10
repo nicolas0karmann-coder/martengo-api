@@ -141,9 +141,28 @@ def predict():
     tous = df_nc.sort_values(['proba_absolu','rapport'], ascending=[False,False])
     top3_absolu = tous.head(3)['numero'].tolist()
 
+    # ── Top features par cheval : rang relatif dans le peloton ──
+    # Pour chaque cheval, on calcule son rang sur 4 dimensions clés
+    # et on l'exprime en percentile (100 = meilleur du peloton)
+    n = len(tous)
+
     # Résultat complet trié par proba absolu
     tous_list = []
-    for _, row in tous.iterrows():
+    for i, (_, row) in enumerate(tous.iterrows()):
+        rang_note    = int((tous['note']              > row['note']).sum())              + 1
+        rang_rapport = int((tous['rapport']           < row['rapport']).sum())            + 1
+        rang_valeur  = int((tous['score_valeur']      > row['score_valeur']).sum())      + 1
+        rang_ratio   = int((tous['ratio_note_rapport']> row['ratio_note_rapport']).sum())+ 1
+
+        def pct(rang): return round((1 - (rang - 1) / n) * 100)
+
+        top_features = sorted([
+            {"feature": "Note",          "valeur": float(row['note']),                       "score": pct(rang_note),    "rang": rang_note,    "total": n},
+            {"feature": "Favori (cote)", "valeur": float(row['rapport']),                    "score": pct(rang_rapport), "rang": rang_rapport, "total": n},
+            {"feature": "Valeur",        "valeur": round(float(row['score_valeur']), 2),     "score": pct(rang_valeur),  "rang": rang_valeur,  "total": n},
+            {"feature": "Ratio note/cote","valeur": round(float(row['ratio_note_rapport']),3),"score": pct(rang_ratio),   "rang": rang_ratio,   "total": n},
+        ], key=lambda x: x['score'], reverse=True)
+
         tous_list.append({
             "numero":          int(row['numero']),
             "note":            float(row['note']),
@@ -152,8 +171,8 @@ def predict():
             "proba_absolu":    round(float(row['proba_absolu']) * 100, 1),
             "top3_principal":  int(row['numero']) in top3_principal,
             "top3_absolu":     int(row['numero']) in top3_absolu,
+            "top_features":    top_features,
         })
-
     return jsonify({
         "tous": tous_list,
         "top3_principal": top3_principal,
